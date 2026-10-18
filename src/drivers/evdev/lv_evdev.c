@@ -303,6 +303,11 @@ static void _evdev_read(lv_indev_t * indev, lv_indev_data_t * data)
 
                 dsc->touch_data_changed = false;
             }
+            break; /* Process one event packet per lv_indev_read() call */
+        }
+#else
+        else if(in.type == EV_SYN && in.code == SYN_REPORT) {
+            break; /* Process one event packet per lv_indev_read() call */
         }
 #endif
     }

@@ -15,6 +15,7 @@
 #include "lv_tjpgd.h"
 #include "../../misc/lv_fs_private.h"
 #include <string.h>
+#include <strings.h>  /* strcasecmp */
 
 /*********************
  *      DEFINES
@@ -106,7 +107,7 @@ static lv_result_t decoder_info(lv_image_decoder_t * decoder, lv_image_decoder_d
     else if(src_type == LV_IMAGE_SRC_FILE) {
         const char * fn = src;
         const char * ext = lv_fs_get_ext(fn);
-        if((lv_strcmp(ext, "jpg") == 0) || (lv_strcmp(ext, "jpeg") == 0)) {
+        if((strcasecmp(ext, "jpg") == 0) || (strcasecmp(ext, "jpeg") == 0)) {
             uint8_t workb[TJPGD_WORKBUFF_SIZE];
             JDEC jd;
             JRESULT rc = jd_prepare(&jd, input_func, workb, TJPGD_WORKBUFF_SIZE, &dsc->file);
@@ -175,7 +176,7 @@ static lv_result_t decoder_open(lv_image_decoder_t * decoder, lv_image_decoder_d
     }
     else if(dsc->src_type == LV_IMAGE_SRC_FILE) {
         const char * fn = dsc->src;
-        if((lv_strcmp(lv_fs_get_ext(fn), "jpg") == 0) || (lv_strcmp(lv_fs_get_ext(fn), "jpeg") == 0)) {
+        if((strcasecmp(lv_fs_get_ext(fn), "jpg") == 0) || (strcasecmp(lv_fs_get_ext(fn), "jpeg") == 0)) {
             f = lv_malloc(sizeof(lv_fs_file_t));
             if(f == NULL) return LV_RESULT_INVALID;
             lv_fs_res_t res;
