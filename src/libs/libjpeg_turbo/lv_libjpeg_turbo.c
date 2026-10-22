@@ -13,7 +13,6 @@
 #include "lv_libjpeg_turbo.h"
 #include <stdio.h>
 #include <jpeglib.h>
-#include <jpegint.h>
 #include <setjmp.h>
 #include "../../core/lv_global.h"
 
@@ -480,7 +479,7 @@ static bool get_jpeg_size(uint8_t * data, uint32_t data_size, uint32_t * width, 
 
 static image_orientation_t get_jpeg_direction(uint8_t * data, uint32_t data_size)
 {
-    image_orientation_t res = IMAGE_CLOCKWISE_NONE;
+    volatile image_orientation_t res = IMAGE_CLOCKWISE_NONE; /* read after longjmp */
     struct jpeg_decompress_struct cinfo;
     error_mgr_t jerr;
 
@@ -494,6 +493,10 @@ static image_orientation_t get_jpeg_direction(uint8_t * data, uint32_t data_size
     }
     /* jpeg_create_decompress */
     jpeg_decompress_prepare(&cinfo, data, data_size);
+    if(jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+        jpeg_destroy_decompress(&cinfo);
+        return res;
+    }
     /* read file exif orientation */
     res = jpeg_markers_reader(&cinfo);
 
@@ -563,12 +566,13 @@ static image_orientation_t jpeg_markers_reader(struct jpeg_decompress_struct * c
 {
     image_orientation_t res = IMAGE_CLOCKWISE_NONE;
 
-    if(cinfo == NULL || cinfo->marker == NULL) {
+    if(cinfo == NULL) {
         return res;
     }
 
-    cinfo->marker->read_markers(cinfo);
-
+    /* The caller has run jpeg_read_header(): the APP1 markers requested with
+     * jpeg_save_markers() are already in marker_list (public API, so the
+     * internal <jpegint.h> that SDK sysroots don't ship is not needed). */
     jpeg_saved_marker_ptr marker = cinfo->marker_list;
     while(marker != NULL) {
         if(marker->marker == APP1_MARKER) {
