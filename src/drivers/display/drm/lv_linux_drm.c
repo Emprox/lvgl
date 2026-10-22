@@ -17,6 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -24,6 +25,7 @@
 
 #include "../../../stdlib/lv_sprintf.h"
 #include "../../../draw/lv_draw_buf.h"
+#include "../../../misc/lv_area_private.h"
 
 #if LV_USE_LINUX_DRM_GBM_BUFFERS
     #include <gbm.h>
@@ -43,6 +45,16 @@
 #endif
 
 #define BUFFER_CNT 2
+
+/* LV_LINUX_DRM_SHADOW_BUF: LVGL renders into a cached RAM buffer and only the
+ * changed areas are copied into the (uncached, write-combined) dumb buffer
+ * that is flipped next. Blending must read the destination pixels, and reads
+ * from write-combined memory are many times slower than from cached RAM. */
+#ifndef LV_LINUX_DRM_SHADOW_BUF
+    #define LV_LINUX_DRM_SHADOW_BUF 0
+#endif
+
+#define SHADOW_DIRTY_MAX 32
 
 /**********************
  *      TYPEDEFS
@@ -78,6 +90,13 @@ typedef struct {
     drmModePropertyPtr conn_props[128];
     drm_buffer_t drm_bufs[BUFFER_CNT];
     drm_buffer_t * act_buf;
+#if LV_LINUX_DRM_SHADOW_BUF
+    uint8_t * shadow;                                   /* LVGL draw buffer (RAM) */
+    uint32_t back_idx;                                  /* dumb buffer not on screen */
+    uint32_t cur;                                       /* dirty list of this frame */
+    lv_area_t dirty[2][SHADOW_DIRTY_MAX];               /* this + previous frame */
+    uint32_t dirty_cnt[2];                              /* > MAX: whole screen */
+#endif
 #if LV_USE_LINUX_DRM_GBM_BUFFERS
     struct gbm_device * gbm_device;
 #endif
@@ -115,7 +134,11 @@ static int drm_setup_buffers(drm_dev_t * drm_dev);
 static int drm_dmabuf_set_plane(drm_dev_t * drm_dev, drm_buffer_t * buf);
 static void drm_flush_wait(lv_display_t * drm_dev);
 static void drm_flush(lv_display_t * disp, const lv_area_t * area, uint8_t * px_map);
-static void drm_dmabuf_set_active_buf(lv_event_t * event);
+#if LV_LINUX_DRM_SHADOW_BUF
+    static void drm_shadow_flush(lv_display_t * disp, const lv_area_t * area, uint8_t * px_map);
+#else
+    static void drm_dmabuf_set_active_buf(lv_event_t * event);
+#endif
 static void drm_del_event_cb(lv_event_t * event);
 
 /**********************
@@ -162,6 +185,7 @@ lv_display_t * lv_linux_drm_create(void)
  * it sets the active buffer. if GBM buffers are used, it issues a DMA_BUF_SYNC
  * ioctl call to lock the buffer for CPU access, the buffer is unlocked just
  * before the atomic commit */
+#if !LV_LINUX_DRM_SHADOW_BUF
 static void drm_dmabuf_set_active_buf(lv_event_t * event)
 {
     drm_dev_t * drm_dev;
@@ -200,6 +224,7 @@ static void drm_dmabuf_set_active_buf(lv_event_t * event)
     }
 
 }
+#endif /*!LV_LINUX_DRM_SHADOW_BUF*/
 
 lv_result_t lv_linux_drm_set_file(lv_display_t * disp, const char * file, int64_t connector_id)
 {
@@ -233,6 +258,27 @@ lv_result_t lv_linux_drm_set_file(lv_display_t * disp, const char * file, int64_
      * to lv_display_create then the buffers aren't big enough for LV_DISPLAY_RENDER_MODE_DIRECT.
      */
     lv_display_set_resolution(disp, hor_res, ver_res);
+
+#if LV_LINUX_DRM_SHADOW_BUF
+    /* Same stride as the dumb buffers so areas copy row by row. */
+    void * shadow = NULL;
+    if(posix_memalign(&shadow, LV_DRAW_BUF_ALIGN, buf_size) != 0) {
+        LV_LOG_ERROR("Shadow buffer allocation failed");
+        return LV_RESULT_INVALID;
+    }
+    lv_memzero(shadow, buf_size);
+    drm_dev->shadow = shadow;
+    drm_dev->back_idx = 0;
+    drm_dev->cur = 0;
+    drm_dev->dirty_cnt[0] = 0;
+    drm_dev->dirty_cnt[1] = SHADOW_DIRTY_MAX + 1;   /* nothing shown yet: copy all */
+    lv_display_set_buffers_with_stride(disp, drm_dev->shadow, NULL, buf_size,
+                                       stride, LV_DISPLAY_RENDER_MODE_DIRECT);
+    /* The shadow is free again as soon as flush returns, so LVGL never has
+     * to wait for the page flip; the flush itself waits before copying. */
+    lv_display_set_flush_wait_cb(disp, NULL);
+    lv_display_set_flush_cb(disp, drm_shadow_flush);
+#else
     lv_display_set_buffers_with_stride(disp, drm_dev->drm_bufs[1].map, drm_dev->drm_bufs[0].map, buf_size,
                                        stride, LV_DISPLAY_RENDER_MODE_DIRECT);
 
@@ -240,6 +286,7 @@ lv_result_t lv_linux_drm_set_file(lv_display_t * disp, const char * file, int64_
     /* Set the handler that is called before a redraw occurs to set the active buffer/plane
      * when GBM buffers are used the DMA_BUF_SYNC_START is issued there */
     lv_display_add_event_cb(disp, drm_dmabuf_set_active_buf, LV_EVENT_REFR_START, drm_dev);
+#endif
 
     if(width) {
         lv_display_set_dpi(disp, DIV_ROUND_UP(hor_res * 25400, width * 1000));
@@ -486,6 +533,7 @@ static int drm_dmabuf_set_plane(drm_dev_t * drm_dev, drm_buffer_t * buf)
     if(ret) {
         LV_LOG_ERROR("drmModeAtomicCommit failed: %s (%d)", strerror(errno), errno);
         drmModeAtomicFree(drm_dev->req);
+        drm_dev->req = NULL;    /* no flip event will come: don't let drm_flush_wait spin on it */
         return ret;
     }
 
@@ -1083,6 +1131,71 @@ static void drm_flush(lv_display_t * disp, const lv_area_t * area, uint8_t * px_
 
 }
 
+#if LV_LINUX_DRM_SHADOW_BUF
+static void shadow_copy_area(drm_dev_t * drm_dev, uint8_t * dst, const lv_area_t * a, uint32_t px_size)
+{
+    uint32_t stride = drm_dev->drm_bufs[0].pitch;
+    size_t offs = (size_t)a->y1 * stride + (size_t)a->x1 * px_size;
+    size_t len = (size_t)lv_area_get_width(a) * px_size;
+    const uint8_t * src = drm_dev->shadow + offs;
+    dst += offs;
+    for(int32_t y = a->y1; y <= a->y2; y++) {
+        lv_memcpy(dst, src, len);
+        src += stride;
+        dst += stride;
+    }
+}
+
+static void drm_shadow_flush(lv_display_t * disp, const lv_area_t * area, uint8_t * px_map)
+{
+    LV_UNUSED(px_map);
+    drm_dev_t * drm_dev = lv_display_get_driver_data(disp);
+    uint32_t cur = drm_dev->cur;
+
+    if(drm_dev->dirty_cnt[cur] < SHADOW_DIRTY_MAX) {
+        drm_dev->dirty[cur][drm_dev->dirty_cnt[cur]] = *area;
+    }
+    drm_dev->dirty_cnt[cur]++;
+
+    if(lv_display_flush_is_last(disp)) {
+        /* The back buffer may still be on screen until the previous flip lands */
+        drm_flush_wait(disp);
+
+        drm_buffer_t * back = &drm_dev->drm_bufs[drm_dev->back_idx];
+        uint32_t px_size = lv_color_format_get_size(lv_display_get_color_format(disp));
+        uint32_t prev = cur ^ 1;
+        lv_area_t full = { 0, 0, (int32_t)drm_dev->width - 1, (int32_t)drm_dev->height - 1 };
+
+        /* The back buffer last got the frame before the previous one, so it
+         * needs this frame's and the previous frame's changes. */
+        if(drm_dev->dirty_cnt[cur] > SHADOW_DIRTY_MAX || drm_dev->dirty_cnt[prev] > SHADOW_DIRTY_MAX) {
+            shadow_copy_area(drm_dev, back->map, &full, px_size);
+        }
+        else {
+            for(uint32_t f = 0; f < 2; f++) {
+                for(uint32_t i = 0; i < drm_dev->dirty_cnt[f]; i++) {
+                    lv_area_t a;
+                    if(lv_area_intersect(&a, &drm_dev->dirty[f][i], &full)) {
+                        shadow_copy_area(drm_dev, back->map, &a, px_size);
+                    }
+                }
+            }
+        }
+
+        if(drm_dmabuf_set_plane(drm_dev, back)) {
+            LV_LOG_ERROR("Flush fail");
+        }
+        else {
+            drm_dev->back_idx ^= 1;
+            drm_dev->cur = prev;
+            drm_dev->dirty_cnt[prev] = 0;
+        }
+    }
+
+    lv_display_flush_ready(disp);
+}
+#endif /*LV_LINUX_DRM_SHADOW_BUF*/
+
 static void drm_del_event_cb(lv_event_t * e)
 {
     if(LV_EVENT_DELETE != lv_event_get_code(e))
@@ -1107,6 +1220,10 @@ static void drm_del_event_cb(lv_event_t * e)
         drmModeAtomicFree(drm_dev->req);
         drm_dev->req = NULL;
     }
+#if LV_LINUX_DRM_SHADOW_BUF
+    free(drm_dev->shadow);
+    drm_dev->shadow = NULL;
+#endif
 
 #if LV_USE_LINUX_DRM_GBM_BUFFERS
     for(int i = 0; i < BUFFER_CNT; ++i) {
